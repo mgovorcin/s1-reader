@@ -2,7 +2,8 @@
 Reader for EOPF-CPM zarr Sentinel-1 SLC products.
 
 Returns Sentinel1BurstSlc objects compatible with compass/s1reader.
-SLC data is served directly from zarr via GDAL /vsimem/ — no tiff written.
+SLC data is written to a temporary on-disk GeoTiff (backing a VRT) because GDAL
+/vsimem/ files are not visible to the isce3 geocoder across process boundaries.
 
 Usage
 -----
@@ -14,6 +15,61 @@ Usage
         swath_num   = 1,
         pol         = "vv",
     )
+
+EOPF-CPM zarr vs SAFE — known differences (as of EOPF-CPM early release, 2024-04)
+-----------------------------------------------------------------------------------
+BURST GROUP NAME (p[2], p[3], p[8]):
+  - p[2]  "relative_orbit" field: internal EOPF counter, NOT the OPERA/ESA relative orbit.
+           Use z.attrs["stac_discovery"]["properties"]["sat:relative_orbit"] instead.
+  - p[3]  hex orbit field (e.g. "A300"): internal EOPF counter, NOT the absolute orbit number.
+           Use z.attrs["stac_discovery"]["properties"]["sat:absolute_orbit"] instead.
+  - p[8]  burst counter: 10× the SAFE esa_burst_id (trailing zero). Divide by 10 to match.
+
+ASCENDING NODE TIME:
+  - Not in per-burst attrs. Available in root attrs:
+    z.attrs["stac_discovery"]["properties"]["sat:anx_datetime"] — matches SAFE to <0.1 s.
+
+SLANT RANGE TIME / STARTING RANGE:
+  - downlink_information["swst_value"] is the raw SWST relative to the PRI (~1e-4 s),
+    NOT the absolute two-way slant range time (~5e-3 s) as in SAFE annotation.
+  - Use conditions/gcp["slant_range_time"] first valid value instead.
+
+GCP DATA (conditions/gcp):
+  - Only the very first GCP entry is populated; all others are NaN (early release limitation).
+  - Consequence: burst border/center cannot be computed from GCPs; a fallback convex hull
+    from the single valid GCP degenerates to a Point rather than a Polygon.
+  - This does not affect geocoding (border is only used for WKT metadata).
+
+DOPPLER LUT2D AZIMUTH TIMES:
+  - Must be in seconds relative to orbit.reference_epoch (ISCE3 convention), matching
+    the radar grid. Setting az_times = [0.0, ...] causes geo2rdr to interpolate completely
+    out of range and produce 100% NaN geocoded output.
+
+FM RATE / DOPPLER CENTROID ENTRIES:
+  - Only 1 valid polynomial entry per burst (SAFE typically has 3+). The spline interpolator
+    requires ≥2 points; we duplicate the single entry with a 1-second offset as a workaround.
+
+IW2 MID-RANGE:
+  - Same swst_value issue as starting_range: use GCP slant_range_time, not swst_value.
+
+VALID PIXEL MASK:
+  - No firstValidSample / lastValidSample arrays in zarr. We use full burst extent (0 to shape-1).
+  - SAFE provides tight per-line masks; zarr bursts may include a few zero-padded edge samples.
+
+CALIBRATION / NOISE LUTs:
+  - Present in quality/calibration and quality/noise_range + noise_azimuth groups.
+  - sigma_naught, beta_naught, gamma, dn calibration vectors are stored per-burst.
+  - Amplitude differences vs SAFE (~5-20%) are expected due to LUT format/interpolation differences.
+
+RFI INFORMATION:
+  - Not available in EOPF zarr. Set burst_rfi_info = None.
+
+ABSOLUTE ORBIT NUMBER:
+  - Per-burst group name (hex p[3]) does not match SAFE abs orbit. Read from STAC root attrs.
+
+ORBIT STATE VECTORS:
+  - zarr contains only 1 state vector per burst (unusable for full orbit interpolation).
+  - A POEORB/RESORB .EOF file is required (orbit_path argument is mandatory).
 """
 
 from __future__ import annotations
@@ -43,10 +99,10 @@ from packaging import version
 from . import s1_annotation
 from .s1_burst_id import S1BurstId
 from .s1_burst_slc import Doppler, Sentinel1BurstSlc
-from .s1_reader import get_osv_list_from_orbit, get_burst_orbit
+from .s1_reader import get_osv_list_from_orbit, get_burst_orbit, get_ascending_node_time_orbit
 
 # S1 C-band centre frequency from SAFE annotation (radarFrequency element).
-# The EOPF zarr does not store this field, so we use the nominal value.
+# The EOPF zarr does not store this field yet, missing in zarr attrs, so we use the nominal value.
 # It is identical for S1A/B/C/D: verified from SAFE XML radarFrequency elements.
 _S1_RADAR_FREQ = 5.40500045433435e9  # Hz
 _C = isce3.core.speed_of_light        # m/s
@@ -88,7 +144,7 @@ def _parse_burst_name(name: str) -> dict:
         "abs_orbit_hex":  p[3],
         "polarization":   p[6].lower(),
         "subswath":       p[7],          # IW1 / IW2 / IW3
-        "esa_burst_id":   int(p[8]),
+        "esa_burst_id":   int(p[8]) // 10,
     }
 
 
@@ -96,9 +152,10 @@ def _parse_burst_name(name: str) -> dict:
 
 def _build_orbit(orbit_path: str,
                  sensing_start: datetime.datetime,
-                 sensing_stop: datetime.datetime) -> isce3.core.Orbit:
-    osv_list = get_osv_list_from_orbit(orbit_path)
-    return get_burst_orbit(sensing_start, sensing_stop, osv_list)
+                 sensing_stop: datetime.datetime):
+    """Return (isce3.Orbit, osv_list). osv_list needed for ascending-node computation."""
+    osv_list = get_osv_list_from_orbit(orbit_path, sensing_start, sensing_stop)
+    return get_burst_orbit(sensing_start, sensing_stop, osv_list), osv_list
 
 
 def _poly1d(coeffs: np.ndarray, t0_slant_s: float) -> isce3.core.Poly1d:
@@ -112,15 +169,19 @@ def _build_doppler(poly1d: isce3.core.Poly1d,
                    range_pixel_spacing: float,
                    shape: tuple,
                    azimuth_time_interval: float,
-                   sensing_start: datetime.datetime) -> Doppler:
+                   sensing_start: datetime.datetime,
+                   orbit: isce3.core.Orbit) -> Doppler:
     n_lines, n_samples = shape
     slant_ranges = starting_range + np.arange(n_samples) * range_pixel_spacing
-    az_times = np.array([0.0, n_lines * azimuth_time_interval])
+    # az_times must be in seconds relative to orbit.reference_epoch (ISCE3 convention)
+    ref_dt = datetime.datetime.fromisoformat(orbit.reference_epoch.isoformat_usec())
+    t0 = (sensing_start - ref_dt).total_seconds()
+    az_times = np.array([t0, t0 + n_lines * azimuth_time_interval])
     freq_1d = np.array([poly1d.eval(r) for r in slant_ranges], dtype=np.float64)
     data_2d = np.vstack([freq_1d, freq_1d])
     lut2d = isce3.core.LUT2d(
         slant_ranges, az_times, data_2d,
-        isce3.core.dataInterpMethod.BILINEAR,
+        isce3.core.DataInterpMethod.BILINEAR,
     )
     return Doppler(poly1d, lut2d)
 
@@ -193,16 +254,25 @@ def _build_noise(nr_group, na_group,
 def _build_extended_coeffs(
     fm_coeffs: np.ndarray, fm_t0s: np.ndarray, fm_times: list,
     dc_coeffs: np.ndarray, dc_t0s: np.ndarray, dc_times: list,
-    sensing_start: datetime.datetime,
 ) -> s1_annotation.BurstExtendedCoeffs:
-    def rel_s(times):
-        return np.array([(t - sensing_start).total_seconds() for t in times])
+    # Spline interpolator requires >= 2 entries — duplicate with small offset if needed
+    # this might change in final zarr product, confirm
+    def ensure_min2(times, coeffs, t0s):
+        if len(times) < 2:
+            dt = datetime.timedelta(seconds=1.0)
+            times = list(times) + [times[0] + dt]
+            coeffs = np.vstack([coeffs, coeffs])
+            t0s = np.concatenate([t0s, t0s])
+        return times, coeffs, t0s
+
+    fm_times, fm_coeffs, fm_t0s = ensure_min2(fm_times, fm_coeffs, fm_t0s)
+    dc_times, dc_coeffs, dc_t0s = ensure_min2(dc_times, dc_coeffs, dc_t0s)
 
     return s1_annotation.BurstExtendedCoeffs(
-        fm_rate_aztime_vec=rel_s(fm_times),
+        fm_rate_aztime_vec=np.array(fm_times),
         fm_rate_coeff_arr=fm_coeffs.copy(),
         fm_rate_tau0_vec=fm_t0s.copy(),
-        dc_aztime_vec=rel_s(dc_times),
+        dc_aztime_vec=np.array(dc_times),
         dc_coeff_arr=dc_coeffs.copy(),
         dc_tau0_vec=dc_t0s.copy(),
     )
@@ -238,15 +308,13 @@ class ZarrBurstSlc(Sentinel1BurstSlc):
         return arr
 
     def slc_to_vrt_file(self, out_path: str):
-        """Write a VRT at out_path backed by a /vsimem/ GTiff from zarr.
-        No file is created on disk.
-        """
+        """Write a VRT at out_path backed by an on-disk GTiff from zarr."""
         slc = self._get_slc_arr()[:]      # (n_lines, n_samples) complex64
         n_lines, n_samples = slc.shape
 
-        vsimem_path = f"/vsimem/zarr_slc_{id(self)}.tif"
+        tif_path = out_path.replace(".vrt", "_slc.tif")
         ds = gdal.GetDriverByName("GTiff").Create(
-            vsimem_path, n_samples, n_lines, 1, gdal.GDT_CFloat32)
+            tif_path, n_samples, n_lines, 1, gdal.GDT_CFloat32)
         ds.GetRasterBand(1).WriteArray(slc)
         ds.FlushCache()
         ds = None
@@ -260,7 +328,7 @@ class ZarrBurstSlc(Sentinel1BurstSlc):
             f'  <VRTRasterBand dataType="CFloat32" band="1">\n'
             f'    <NoDataValue>0.0</NoDataValue>\n'
             f'    <SimpleSource>\n'
-            f'      <SourceFilename relativeToVRT="0">{vsimem_path}</SourceFilename>\n'
+            f'      <SourceFilename relativeToVRT="0">{tif_path}</SourceFilename>\n'
             f'      <SourceBand>1</SourceBand>\n'
             f'      <SourceProperties RasterXSize="{n_samples}" RasterYSize="{n_lines}"'
             f' DataType="CFloat32"/>\n'
@@ -292,6 +360,13 @@ def _register(burst: ZarrBurstSlc, zarr_arr) -> None:
 
 
 # ── iw2_mid_range helper ─────────────────────────────────────────────────────
+#
+# EOPF zarr difference: downlink_information["swst_value"] is the raw Sampling
+# Window Start Time relative to the PRI (~1.04e-4 s). SAFE annotation stores the
+# absolute two-way slant range time (~5.34e-3 s). Using swst_value directly gives
+# iw2_mid_range ~58 km instead of the correct ~877 km, causing bistatic delay
+# correction errors and all-NaN geocoded output.
+# Fix: use GCP slant_range_time (first valid entry) instead. Check swst_value later.
 
 def _iw2_mid_range(z) -> float:
     """Compute iw2_mid_range from any IW2 burst in the zarr store."""
@@ -301,14 +376,34 @@ def _iw2_mid_range(z) -> float:
         return 0.0
     g = z[iw2_keys[0]]
     di = dict(g.attrs).get("other_metadata", {}).get("downlink_information", {})
-    fs   = float(di.get("sampling_frequency_after_decimation", 64.345e6))
-    swst = float(di.get("swst_value", 0.005646))
-    rps  = _C / (2.0 * fs)
-    n_s  = g["measurements/slc"].shape[1]
-    return swst * _C / 2.0 + 0.5 * n_s * rps
+    #fs   = float(di.get("sampling_frequency_after_decimation", 64.345e6))
+    #swst = float(di.get("swst_value", 0.005646))
+    #rps  = _C / (2.0 * fs)
+    #n_s  = g["measurements/slc"].shape[1]
+    #return swst * _C / 2.0 + 0.5 * n_s * rps
+    fs  = float(di.get("sampling_frequency_after_decimation", 64.345e6))
+    rps = _C / (2.0 * fs)
+    n_s = g["measurements/slc"].shape[1]
+    gcp_srt = g["conditions/gcp"]["slant_range_time"][:]
+    valid_srt = gcp_srt[~np.isnan(gcp_srt)]
+    slant_range_time = float(valid_srt[0]) if len(valid_srt) > 0 else float(di.get("swst_value", 0.005646))
+    return slant_range_time * _C / 2.0 + 0.5 * n_s * rps
 
 
 # ── per-burst polynomial extraction ─────────────────────────────────────────
+#
+# EOPF zarr difference: polynomials (FM rate, Doppler centroid) are stored in
+# fixed-size arrays of 10 entries per burst, with only the first entry valid and
+# the rest NaN. SAFE XML typically has 3+ entries per burst.
+# Consequence: _build_extended_coeffs must duplicate the single entry to satisfy
+# the spline interpolator which requires ≥2 control points.
+#
+# Additional difference: t0 (slant range time origin for polynomial) is float32
+# in zarr vs float64 in SAFE — minor precision loss, acceptable for geocoding.
+#
+# Azimuth times in zarr polynomial groups are encoded as integers in nanoseconds
+# from the start of the burst acquisition (not absolute UTC). _decode_time()
+# converts them to absolute datetime using the "units" attribute.
 
 def _nearest_valid_poly(poly_group, coeff_key: str, t0_key: str,
                         az_mid: datetime.datetime):
@@ -370,9 +465,21 @@ def load_bursts_from_zarr(
         return []
 
     # Mission / frequency / wavelength from filename
-    mission = Path(zarr_path).stem[:3].upper()
+    stem = Path(zarr_path).stem
+    mission = stem[:3].upper()
     radar_freq = _S1_RADAR_FREQ
     wavelength = _C / radar_freq
+
+    # Read absolute orbit, relative orbit, and ascending node time from root STAC attrs.
+    # EOPF-CPM zarr stores these in z.attrs["stac_discovery"]["properties"] as STAC SAT fields.
+    # The burst group name field p[2] is an internal EOPF counter, NOT the OPERA relative orbit.
+    # The burst group field p[3] (hex) is also an internal counter, NOT the abs orbit number.
+    _stac = dict(z.attrs).get("stac_discovery", {}).get("properties", {})
+    abs_orbit_number = int(_stac.get("sat:absolute_orbit", 0))
+    _relative_orbit  = int(_stac.get("sat:relative_orbit", 0))
+    _anx_dt_str      = _stac.get("sat:anx_datetime", None)
+    _anx_time = (datetime.datetime.fromisoformat(_anx_dt_str.rstrip("Z"))
+                 if _anx_dt_str else None)
 
     # iw2_mid_range from any IW2 burst (needed for bistatic delay)
     iw2_mid = _iw2_mid_range(z)
@@ -411,7 +518,11 @@ def load_bursts_from_zarr(
         # Range parameters
         fs               = float(di.get("sampling_frequency_after_decimation", 64.345e6))
         range_pixel_spacing = _C / (2.0 * fs)
-        slant_range_time = float(di.get("swst_value", 1.043e-4))
+        # swst_value is relative to PRI — use the first valid GCP slant_range_time instead
+        # slant_range_time = float(di.get("swst_value", 1.043e-4))
+        gcp_srt = g["conditions/gcp"]["slant_range_time"][:]
+        valid_srt = gcp_srt[~np.isnan(gcp_srt)]
+        slant_range_time = float(valid_srt[0]) if len(valid_srt) > 0 else float(di.get("swst_value", 1.043e-4))
         starting_range   = slant_range_time * _C / 2.0
         range_bandwidth  = float(rp.get("look_bandwidth", rp.get("total_bandwidth", 56.5e6)))
         range_window_coefficient = float(rp.get("window_coefficient", 0.75))
@@ -425,7 +536,7 @@ def load_bursts_from_zarr(
         average_azimuth_pixel_spacing = 13.9
 
         # Orbit from EOF
-        orbit = _build_orbit(orbit_path, sensing_start, sensing_stop)
+        orbit, osv_list = _build_orbit(orbit_path, sensing_start, sensing_stop)
         orbit_direction = "ASCENDING"  # override via orbit if needed
 
         # Mid-burst azimuth time for polynomial selection
@@ -443,21 +554,40 @@ def load_bursts_from_zarr(
             "data_dc_polynomial", "t0", az_mid)
 
         doppler = _build_doppler(dc_poly1d, starting_range, range_pixel_spacing,
-                                  shape, azimuth_time_interval, sensing_start)
+                                  shape, azimuth_time_interval, sensing_start, orbit)
 
         # Burst ID
-        burst_id = S1BurstId(
-            track_number=parsed["relative_orbit"],
-            esa_burst_id=parsed["esa_burst_id"],
-            subswath=swath_tag.lower(),
-        )
+        # - EOPF zarr root attrs carry sat:relative_orbit and sat:anx_datetime (STAC SAT).
+        #   These match the SAFE values exactly, so we prefer them.
+        # - The burst group name field p[2] is an internal EOPF counter ≠ OPERA relative orbit.
+        # - The burst group field p[8] (esa_burst_id) has a trailing zero vs SAFE → divide by 10.
+        # - Fallback: recompute from orbit ANX if STAC attrs are absent.
+        try:
+            anx_time = _anx_time or get_ascending_node_time_orbit(osv_list, sensing_start)
+            burst_id = S1BurstId.from_burst_params(
+                sensing_start, anx_time,
+                _relative_orbit, _relative_orbit,
+                swath_tag,
+            )
+        except Exception:
+            burst_id = S1BurstId(
+                track_number=_relative_orbit,
+                esa_burst_id=parsed["esa_burst_id"],
+                subswath=swath_tag.lower(),
+            )
 
-        # Valid pixel region — zarr doesn't store firstValidSample arrays,
-        # use full burst extent
-        first_valid_line   = 0
-        last_valid_line    = shape[0] - 1
-        first_valid_sample = 0
-        last_valid_sample  = shape[1] - 1
+        # Valid pixel region — zarr doesn't store firstValidSample/lastValidSample.
+        # Derive from data: the burst SLC has zero-padded invalid columns at both edges.
+        # Sample mid-row and mid-column to find the nonzero extent.
+        slc_arr = g["measurements/slc"]
+        _mid_row = slc_arr[shape[0] // 2, :][:]
+        _mid_col = slc_arr[:, shape[1] // 2][:]
+        _nz_s = np.where(np.abs(_mid_row) > 0)[0]
+        _nz_l = np.where(np.abs(_mid_col) > 0)[0]
+        first_valid_sample = int(_nz_s[0])  if len(_nz_s) else 0
+        last_valid_sample  = int(_nz_s[-1]) if len(_nz_s) else shape[1] - 1
+        first_valid_line   = int(_nz_l[0])  if len(_nz_l) else 0
+        last_valid_line    = int(_nz_l[-1]) if len(_nz_l) else shape[0] - 1
 
         # Border & center from GCPs
         gcp  = g["conditions/gcp"]
@@ -465,10 +595,13 @@ def load_bursts_from_zarr(
         lons = gcp["longitude"][:]
         vg   = ~np.isnan(lats)
         if np.any(vg):
-            center = (float(np.nanmean(lons)), float(np.nanmean(lats)))
-            border = list(zip(lons[vg].tolist(), lats[vg].tolist()))
+            import shapely.geometry
+            center = shapely.geometry.Point(float(np.nanmean(lons)), float(np.nanmean(lats)))
+            pts = shapely.geometry.MultiPoint(list(zip(lons[vg].tolist(), lats[vg].tolist())))
+            border = [pts.convex_hull]
         else:
-            center, border = (0.0, 0.0), []
+            import shapely.geometry
+            center, border = shapely.geometry.Point(0.0, 0.0), []
 
         # Calibration & noise
         burst_calibration = _build_calibration(g["quality/calibration"])
@@ -496,14 +629,9 @@ def load_bursts_from_zarr(
         extended_coeffs = _build_extended_coeffs(
             fm_cv, fm_tv, fm_times,
             dc_cv, dc_tv, dc_times,
-            sensing_start,
         )
 
-        burst_rfi_info = SimpleNamespace(
-            rfi_mitigation_performed="false",
-            rfi_mitigation_domain="",
-            rfi_burst_report={},
-        )
+        burst_rfi_info = None
 
         burst_misc_metadata = SimpleNamespace(
             processing_info_dict={},
