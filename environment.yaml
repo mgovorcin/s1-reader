@@ -10,3 +10,5 @@ dependencies:
   - requests>=2.0
   - shapely>=1.8
   - lxml>=4.8
+  # zarr is optional (EOPF-CPM zarr reader); install via `pip install .[zarr]`
+  # or add `zarr` here if you need s1reader.s1_reader_zarr.
