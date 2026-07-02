@@ -84,11 +84,6 @@ from typing import Optional
 import numpy as np
 
 try:
-    import zarr
-except ImportError:
-    raise ImportError("zarr is required: pip install zarr")
-
-try:
     import isce3
 except ImportError:
     raise ImportError("isce3 is required")
@@ -456,6 +451,13 @@ def load_bursts_from_zarr(
         raise ValueError("swath_num must be 1, 2, or 3")
     pol = pol.lower()
     swath_tag = f"IW{swath_num}"
+
+    try:
+        import zarr
+    except ImportError as exc:
+        raise ImportError(
+            "zarr is required for the EOPF zarr reader: pip install 's1reader[zarr]'"
+        ) from exc
 
     z = zarr.open(str(zarr_path), mode="r")
 
